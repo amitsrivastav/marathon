@@ -65,7 +65,7 @@ trait NetworkConversion {
   }
 
   implicit val portMappingRamlReader: Reads[ContainerPortMapping, state.Container.PortMapping] = Reads {
-    case ContainerPortMapping(containerPort, hostPort, labels, name, protocol, servicePort) =>
+    case ContainerPortMapping(containerPort, hostPort, labels, name, protocol, servicePort, networkName) =>
       import state.Container.PortMapping._
       state.Container.PortMapping(
         containerPort = containerPort,
@@ -73,7 +73,8 @@ trait NetworkConversion {
         servicePort = servicePort,
         protocol = protocol.value,
         name = name,
-        labels = labels
+        labels = labels,
+        networkName = networkName
       )
   }
 

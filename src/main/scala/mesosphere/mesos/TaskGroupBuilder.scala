@@ -84,7 +84,7 @@ object TaskGroupBuilder extends StrictLogging {
   // We use that list to swap the dynamic ports (ports set to 0) with the matched ones.
   private[this] def computePortMappings(
     endpoints: Seq[raml.Endpoint],
-    hostPorts: Seq[Option[Int]]): Seq[mesos.NetworkInfo.PortMapping] = {
+    hostPorts: Seq[Option[Int]]): Seq[(Option[String], mesos.NetworkInfo.PortMapping)] = {
 
     endpoints.zip(hostPorts).collect {
       case (endpoint, Some(hostPort)) =>
@@ -101,10 +101,10 @@ object TaskGroupBuilder extends StrictLogging {
         // port mapping for every single protocol. If protocols are set, a port mapping
         // will be created for every protocol in the list.
         if (endpoint.protocol.isEmpty) {
-          Seq(portMapping.build)
+          Seq((endpoint.networkName, portMapping.build))
         } else {
           endpoint.protocol.map { protocol =>
-            portMapping.setProtocol(protocol).build
+            (endpoint.networkName, portMapping.setProtocol(protocol).build)
           }
         }
     }.flatten
@@ -162,7 +162,7 @@ object TaskGroupBuilder extends StrictLogging {
   private[this] def computeExecutorInfo(
     podDefinition: PodDefinition,
     portsMatch: PortsMatch,
-    portMappings: Seq[mesos.NetworkInfo.PortMapping],
+    portMappings: Seq[(Option[String], mesos.NetworkInfo.PortMapping)],
     instanceId: Instance.Id,
     frameworkId: mesos.FrameworkID): mesos.ExecutorInfo.Builder = {
     val executorID = mesos.ExecutorID.newBuilder.setValue(instanceId.executorIdString)
@@ -187,7 +187,10 @@ object TaskGroupBuilder extends StrictLogging {
           mesos.NetworkInfo.newBuilder
             .setName(containerNetwork.name)
             .setLabels(containerNetwork.labels.toMesosLabels)
-            .addAllPortMappings(portMappings)
+            .addAllPortMappings(portMappings.collect {
+              case (networkName, pm) if networkName.forall(_ == containerNetwork.name) =>
+                pm
+            })
       }.foreach{ networkInfo =>
         containerInfo.addNetworkInfos(networkInfo)
       }
