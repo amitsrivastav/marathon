@@ -5,6 +5,7 @@ import definitions._
 import org.raml.v2.api.RamlModelResult
 import org.raml.v2.api.model.v10.api.Library
 import org.raml.v2.api.model.v10.datamodel._
+import treehugger.forest
 import treehuggerDSL._
 
 import scala.annotation.tailrec
@@ -30,7 +31,8 @@ object RamlTypeGenerator {
       "time-only" -> RootClass.newClass("java.time.LocalTime"),
       "datetime-only" -> RootClass.newClass("java.time.LocalDateTime"),
       "datetime" -> RootClass.newClass("java.time.OffsetDateTime"),
-      "RamlGenerated" -> RootClass.newClass("RamlGenerated")
+      "RamlGenerated" -> RootClass.newClass("RamlGenerated"),
+      "RamlConstraints" -> RootClass.newClass("RamlConstraints")
     )
 
   val builtInTypes = Set(
@@ -232,9 +234,19 @@ object RamlTypeGenerator {
   }
 
   object Constraint {
+    /** custom, non-play constraint implementations that we've implemented as part of this generator */
+    sealed trait RamlConstraint extends Constraint
+
+    object RamlConstraint {
+      def apply(f: => Tree): RamlConstraint = new RamlConstraint {
+        override def validate(): Tree = f
+      }
+    }
+
     def MaxLength(len: Integer) = Constraint { REF("maxLength") APPLYTYPE StringClass APPLY(LIT(len)) }
     def MinLength(len: Integer) = Constraint { REF("minLength") APPLYTYPE StringClass APPLY(LIT(len)) }
     def Pattern(p: String) = Constraint { REF("pattern") APPLY(LIT(p) DOT "r") }
+    def KeyPattern(p: String, t: Type) = RamlConstraint { REF("keyPattern") APPLYTYPE t APPLY(LIT(p) DOT "r") }
 
     def MaxItems(len: Integer, t: Type) = Constraint { REF("maxLength") APPLYTYPE t APPLY(LIT(len)) }
     def MinItems(len: Integer, t: Type) = Constraint { REF("minLength") APPLYTYPE t APPLY(LIT(len)) }
@@ -246,7 +258,7 @@ object RamlTypeGenerator {
       override def validate(): Tree = f
     }
 
-    implicit class Constraints(c: Seq[Constraint]) {
+    implicit class Constraints(val c: Seq[Constraint]) extends AnyVal {
       def validate(exp: Tree): Tree = {
         if (c.isEmpty) {
           exp
@@ -256,8 +268,27 @@ object RamlTypeGenerator {
             case Nil => chain
             case c :: rs => buildChain(rs, chain INFIX("keepAnd", c.validate()))
           }
+
           exp APPLY buildChain(c.tail.to[ List ], c.head.validate())
         }
+      }
+
+    }
+
+    implicit class AllConstraints(val c: Seq[Seq[Constraint]]) extends AnyVal {
+      def requiredImports: Seq[Tree] = {
+        val flattened = c.flatten
+        if (flattened.isEmpty) {
+          Nil
+        } else {
+          Seq(
+            Option(IMPORT(PlayReads DOT "_")),
+            if (c.exists(_.size > 1)) Option(IMPORT("play.api.libs.functional.syntax._")) else None,
+            flattened.collectFirst {
+              case _: RamlConstraint => IMPORT("RamlConstraints._")
+            }
+          )
+        }.flatten
       }
     }
   }
@@ -422,8 +453,7 @@ object RamlTypeGenerator {
         )
       } else if (actualFields.size > 22 || actualFields.exists(f => f.repeated || f.omitEmpty || f.constraints.nonEmpty) ||
         actualFields.map(_.toString).exists(t => t.toString.startsWith(name) || t.toString.contains(s"[$name]"))) {
-        actualFields.find(_.constraints.nonEmpty).map(_ => Seq(IMPORT(PlayReads DOT "_"))).getOrElse(Nil) ++
-        actualFields.find(_.constraints.size > 1).map(_ => Seq(IMPORT("play.api.libs.functional.syntax._"))).getOrElse(Nil) ++ Seq(
+        actualFields.map(_.constraints).requiredImports ++ Seq(
           OBJECTDEF("playJsonFormat") withParents PLAY_JSON_FORMAT(name) withFlags Flags.IMPLICIT := BLOCK(
             DEF("reads", PLAY_JSON_RESULT(name)) withParams PARAM("json", PlayJsValue) := BLOCK(
               actualFields.map { field =>
@@ -664,6 +694,12 @@ object RamlTypeGenerator {
               Option(n.maximum()).map(v => Constraint.Max(toNum(v), fieldType)),
               Option(n.minimum()).map(v => Constraint.Min(toNum(v), fieldType))
             ).flatten
+          case o: ObjectTypeDeclaration if typeIsActuallyAMap(o) =>
+            // last field of map-types has the pattern-matching spec that defines the key space, see typeIsActuallyAMap
+            val pattern = o.properties.last.name()
+            val valueType = typeTable(o.properties.last.`type`())
+            if(pattern != "/.*/" && pattern != "/^.*$/") Seq(Constraint.KeyPattern(pattern, valueType)) else Nil
+
         }.getOrElse(Nil)
       }
       def createField(fieldOwner: String, field: TypeDeclaration): FieldT = {
@@ -704,12 +740,14 @@ object RamlTypeGenerator {
             val fieldType = typeTable(Option(n.format()).getOrElse("double"))
             FieldT(n.name(), fieldType, comments, buildConstraints(field, fieldType), required, defaultValue, forceOptional = forceOptional, omitEmpty = omitEmpty)
           case o: ObjectTypeDeclaration if typeIsActuallyAMap(o) =>
-            o.properties.head match {
+            val fieldType = o.properties.head match {
               case n: NumberTypeDeclaration =>
-                FieldT(o.name(), TYPE_MAP(StringClass, typeTable(Option(n.format()).getOrElse("double"))), comments, Nil, false, defaultValue, true, forceOptional = forceOptional, omitEmpty = omitEmpty)
+                TYPE_MAP(StringClass, typeTable(Option(n.format()).getOrElse("double")))
               case t =>
-                FieldT(o.name(), TYPE_MAP(StringClass, typeTable(t.`type`())), comments, Nil, false, defaultValue, true, forceOptional = forceOptional, omitEmpty = omitEmpty)
+                TYPE_MAP(StringClass, typeTable(t.`type`()))
             }
+            val constraints = buildConstraints(o, fieldType)
+            FieldT(o.name(), fieldType, comments, constraints, false, defaultValue, true, forceOptional = forceOptional, omitEmpty = omitEmpty)
           case t: TypeDeclaration =>
             val (name, fieldType) = if (t.`type`() != "object") {
               t.name() -> typeTable(t.`type`())
@@ -807,7 +845,37 @@ object RamlTypeGenerator {
   def generateBuiltInTypes(pkg: String): Map[String, Tree] = {
     val baseType = TRAITDEF("RamlGenerated").tree.withDoc("Marker trait indicating generated code.")
       .inPackage(pkg).withComment(NoCodeCoverageReporting)
-    Map("RamlGenerated" -> baseType)
+    val ramlConstraints = BLOCK(
+      (TRAITDEF("RamlConstraints") := BLOCK(
+        DEF("keyPattern")
+          withTypeParams(TYPEVAR(RootClass.newAliasType("T")))
+          withParams(
+            PARAM("regex", "=> scala.util.matching.Regex"),
+            PARAM("error", StringClass) := LIT("error.pattern")
+          )
+          withParams(
+            PARAM("reads", PLAY_JSON_READS("Map[String,T]"))
+          ).withFlags(Flags.IMPLICIT) := PLAY_JSON_READS("Map[String,T]").APPLY(LAMBDA(PARAM("js")) ==> BLOCK(
+              ((REF("reads") DOT "reads") APPLY(REF("js")) DOT "flatMap").APPLY(LAMBDA(PARAM("m")) ==> BLOCK(
+                VAL("errors") := (REF("m") DOT "map" APPLY (BLOCK(
+                  CASE(TUPLE(REF("o"), WILDCARD)) ==>
+                    (((REF("regex") DOT "unapplySeq") APPLY REF("o")) DOT "map" APPLY(
+                      LAMBDA(PARAM(WILDCARD)) ==> (PlayJsSuccess APPLY REF("o"))
+                    )) DOT "getOrElse" APPLY (PlayJsError APPLY(PlayPath DOT "\\" APPLY(REF("o")), REF("error")))
+                ))) DOT "collect" APPLY(BLOCK(
+                  CASE(ID("err") withType(PlayJsError)) ==> REF("err")
+                )),
+                IF(REF("errors") DOT "isEmpty") THEN(PlayJsSuccess APPLY(REF("m")))
+                  ELSE(REF("errors") DOT "fold" APPLY(PlayJsError APPLY(REF("Nil"))) APPLY(WILDCARD DOT "++" APPLY WILDCARD))
+              ))
+            ))
+        )).withDoc("Validation helpers for generated RAML code."),
+      CASEOBJECTDEF("RamlConstraints").withParents("RamlConstraints").tree
+    ).inPackage(pkg).withComment(NoCodeCoverageReporting)
+    Map(
+      "RamlGenerated" -> baseType,
+      "RamlConstraints" -> ramlConstraints
+    )
   }
 
   def apply(models: Seq[RamlModelResult], pkg: String): Map[String, Tree] = {
